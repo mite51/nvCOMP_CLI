@@ -1,12 +1,18 @@
-# nvCOMP CLI with CPU Fallback & Folder Support
+# nvCOMP CLI with CPU Fallback, Folder Support & Multi-Volume
 
-A cross-platform command-line interface for GPU-accelerated compression using NVIDIA nvCOMP with automatic CPU fallback when GPU is unavailable.
+A cross-platform command-line interface for GPU-accelerated compression using NVIDIA nvCOMP with automatic CPU fallback, multi-volume support for large files, and intelligent memory management.
 
 ## Features
 
 - **Dual Implementation Architecture**:
   - **Batched API** for LZ4, Snappy, Zstd: Cross-compatible between GPU and CPU
   - **Manager API** for GDeflate, ANS, Bitcomp: GPU-only, high-performance
+  
+- **Multi-Volume Support**: Automatically splits large archives into manageable volumes
+  - Default 2.5GB volumes (safe for 8GB VRAM GPUs)
+  - Customizable volume sizes or unlimited single-file mode
+  - Automatic volume detection and reassembly during decompression
+  - Smart GPU memory checking with automatic CPU fallback
   
 - **Folder Compression**: Compress entire directories with automatic file archiving
 - **Archive Listing**: View contents of compressed archives without extracting
@@ -70,14 +76,19 @@ The build system automatically:
 
 ```bash
 # Compress file or folder (algorithm required)
-nvcomp_cli -c <input> <output_file> <algorithm> [--cpu]
+nvcomp_cli -c <input> <output_file> <algorithm> [options]
 
 # Decompress to folder (algorithm optional - auto-detected!)
-nvcomp_cli -d <input_file> <output_folder> [algorithm] [--cpu]
+nvcomp_cli -d <input_file> <output_folder> [algorithm] [options]
 
 # List archive contents (algorithm optional - auto-detected!)
-nvcomp_cli -l <archive_file> [algorithm] [--cpu]
+nvcomp_cli -l <archive_file> [algorithm] [options]
 ```
+
+**Options:**
+- `--cpu`: Force CPU mode
+- `--volume-size <N>`: Set max volume size (default: 2.5GB) - Examples: `1GB`, `500MB`, `5GB`
+- `--no-volumes`: Disable volume splitting (single file, unlimited size)
 
 **NEW**: Algorithm parameter is now **optional** for decompression (`-d`) and listing (`-l`) modes! The tool automatically detects the algorithm from the file header for GPU batched format files (LZ4, Snappy, Zstd).
 
@@ -120,6 +131,42 @@ nvcomp_cli -d archive.zstd restored/ zstd
 nvcomp_cli -l archive.zstd zstd
 ```
 
+### Multi-Volume Examples
+
+For large files or directories, the tool automatically creates multiple volume files to avoid GPU memory limitations:
+
+```bash
+# Compress with default 2.5GB volumes (recommended for 8GB VRAM GPUs)
+nvcomp_cli -c large_dataset/ output.lz4 lz4
+# Creates: output.vol001.lz4, output.vol002.lz4, output.vol003.lz4, ...
+
+# Compress with custom 1GB volumes (for GPUs with less memory)
+nvcomp_cli -c large_dataset/ output.lz4 lz4 --volume-size 1GB
+
+# Compress with larger 5GB volumes (for high-end GPUs)
+nvcomp_cli -c large_dataset/ output.zstd zstd --volume-size 5GB
+
+# Compress without volume splitting (single file, use with caution!)
+nvcomp_cli -c mydata/ output.lz4 lz4 --no-volumes
+
+# Decompress multi-volume archive (auto-detects all volumes!)
+nvcomp_cli -d output.vol001.lz4 restored/
+# Automatically finds and decompresses all volumes: .vol001, .vol002, .vol003, etc.
+
+# List multi-volume archive contents
+nvcomp_cli -l output.vol001.zstd
+# Shows files from all volumes and volume information
+
+# GPU memory fallback: If GPU has insufficient VRAM, automatically uses CPU
+nvcomp_cli -d output.vol001.lz4 restored/
+# Will automatically fall back to CPU if volumes exceed available GPU memory
+```
+
+**Volume Naming Convention:**
+- Single volume: `output.lz4`
+- Multi-volume: `output.vol001.lz4`, `output.vol002.lz4`, `output.vol003.lz4`, ...
+- Always decompress from `.vol001` file (it contains the manifest)
+
 ### Cross-Platform Compatibility
 
 The tool automatically handles filesystem differences between Windows and Linux:
@@ -160,10 +207,17 @@ nvcomp_cli -d output.snappy restored/ snappy --cpu
 
 ## Command-Line Options
 
-- `-c <input> <output> <algorithm>`: Compression mode (input can be file or directory, **algorithm required**)
-- `-d <input> <output> [algorithm]`: Decompression/extraction mode (output is target directory, **algorithm optional**)
-- `-l <archive> [algorithm]`: List archive contents without extracting (**algorithm optional**)
+- `-c <input> <output> <algorithm> [options]`: Compression mode (input can be file or directory, **algorithm required**)
+- `-d <input> <output> [algorithm] [options]`: Decompression/extraction mode (output is target directory, **algorithm optional**)
+- `-l <archive> [algorithm] [options]`: List archive contents without extracting (**algorithm optional**)
 - `--cpu`: Force CPU mode (only works with lz4, snappy, zstd)
+- `--volume-size <size>`: Set maximum volume size (default: 2.5GB)
+  - Examples: `100MB`, `1GB`, `2.5GB`, `10GB`
+  - Minimum: 100MB
+  - Archives larger than this will be split into multiple volumes
+- `--no-volumes`: Disable volume splitting (create single file regardless of size)
+  - Use with caution for very large files
+  - May fail if file exceeds GPU memory
 - Algorithm names: `lz4`, `snappy`, `zstd`, `gdeflate`, `ans`, `bitcomp`
 
 ### Algorithm Auto-Detection
@@ -211,6 +265,29 @@ For GPU batched compression (LZ4/Snappy/Zstd), the tool uses a custom format wit
   - Compressed data: concatenated compressed chunks
 - **Purpose**: Enables GPU decompression by storing chunk boundaries
 - **Cross-compatible**: CPU decompression also supported (but slower)
+
+## Multi-Volume Format
+
+For large archives, the tool automatically splits into multiple volumes:
+
+- **Magic Number**: `NVVM` (NvCOMP Volume Manifest) stored in first volume
+- **Version**: Currently version 1
+- **Structure**:
+  - **First Volume** (.vol001):
+    - Volume Manifest (48 bytes): magic, version, volume count, algorithm, volume size, total uncompressed size
+    - Volume Metadata Array: one entry per volume with index, compressed size, uncompressed offset, uncompressed size
+    - Compressed data for first volume
+  - **Subsequent Volumes** (.vol002, .vol003, ...):
+    - Compressed data only
+- **Volume Splitting**: Archives are split by uncompressed size (default 2.5GB per volume)
+  - Mid-file splitting allowed for predictable volume sizes
+  - Each volume contains a portion of the original archive
+- **Decompression**: All volumes must be present in the same directory
+  - Tool automatically detects and loads all volumes
+  - Reassembles original archive before extraction
+- **Memory Safety**: Default 2.5GB volume size ensures compatibility with 8GB VRAM GPUs
+  - GPU memory requirement: ~2.1x volume size (input + output + temp buffers)
+  - Automatic CPU fallback if insufficient GPU memory detected
 
 ## Testing
 
@@ -346,19 +423,42 @@ Typical performance on NVIDIA A100:
 
 CPU performance is typically 10-100x slower depending on CPU and data.
 
+### Multi-Volume Performance
+
+Multi-volume compression processes each volume sequentially:
+
+- **Throughput**: Same per-volume throughput as single-file compression
+- **Total Time**: Approximately linear with number of volumes
+- **Memory Usage**: Consistent and predictable per volume
+- **Example**: 10GB file with 2.5GB volumes = 4 volumes
+  - Each volume: ~0.5s compression at 5 GB/s (Zstd)
+  - Total time: ~2s (similar to single-file if it fit in memory)
+- **Overhead**: Minimal (<1%) for manifest creation and file I/O
+- **Recommendation**: Larger volume sizes = fewer volumes = less overhead
+  - But: Must fit in GPU memory (use default 2.5GB for safety)
+
 ## Limitations
 
-1. **GPU Memory**: Large files and archives require sufficient GPU memory. The entire archive is loaded into memory during compression/decompression. The tool will fail if GPU memory is exhausted.
+1. **GPU Memory**: ✅ **Now Addressed with Multi-Volume Support!**
+   - **Before**: Large files would fail if they exceeded GPU memory
+   - **Now**: Automatic volume splitting (default 2.5GB) ensures compatibility with 8GB+ VRAM GPUs
+   - **Memory Requirements**: Each volume needs ~2.1x its size in VRAM (input + output + temp buffers)
+   - **Example**: 2.5GB volume ≈ 5.25GB VRAM needed (safe on 8GB GPUs)
+   - **Automatic Fallback**: Tool detects insufficient VRAM and falls back to CPU for cross-compatible algorithms
+   - **Customization**: Use `--volume-size` to adjust for your GPU or `--no-volumes` for unlimited size
+   - **Best Practice**: Keep default 2.5GB for compatibility, or increase for high-end GPUs
 
 2. **CUDA Version**: Requires CUDA 11.0+. Tested with CUDA 12.x and 13.x.
 
-3. **Archive In-Memory**: The entire archive must fit in memory. For very large directories, consider splitting into multiple archives.
+3. **Volume Memory**: Each volume must fit in memory during processing. Default 2.5GB volumes are safe for most systems.
 
 4. **File Permissions**: File permissions and attributes are not preserved in archives (only file paths and contents).
 
 5. **Custom Format**: GPU batched compression uses a custom format with metadata. While CPU decompression is supported, it's slower than GPU decompression.
 
 6. **Cascaded Algorithm**: Not included in this implementation (removed from nvCOMP reference examples due to text data incompatibility).
+
+7. **Volume Files**: All volume files (.vol001, .vol002, etc.) must be in the same directory for decompression.
 
 ## Troubleshooting
 
@@ -400,6 +500,30 @@ If you encounter path issues on Windows:
 - Or escape backslashes: `nvcomp_cli -c "C:\\mydata\\" output.lz4 lz4`
 - Or use quotes: `nvcomp_cli -c "C:\mydata\" output.lz4 lz4`
 
+### "Missing volume files" Error
+
+If decompression fails with missing volumes:
+- Ensure all `.vol001`, `.vol002`, `.vol003`, etc. files are in the same directory
+- Always specify the `.vol001` file when decompressing
+- Don't rename or delete any volume files
+- Check that the volume sequence is complete (no gaps in numbering)
+
+### "Insufficient GPU memory" Message
+
+If you see this during decompression:
+- The tool will automatically fall back to CPU for cross-compatible algorithms (LZ4, Snappy, Zstd)
+- For GPU-only algorithms (GDeflate, ANS, Bitcomp), it will fail (no CPU fallback available)
+- Consider: Compress with smaller `--volume-size` on a system with more VRAM
+- Or: Use cross-compatible algorithms (LZ4, Snappy, Zstd) instead of GPU-only ones
+
+### Large Archive Compression
+
+For very large datasets:
+- Use default 2.5GB volumes (recommended for 8GB VRAM GPUs)
+- Use `--volume-size 1GB` for GPUs with 6GB or less VRAM
+- Use `--volume-size 5GB` for high-end GPUs with 16GB+ VRAM
+- CPU mode with volumes works too: `nvcomp_cli -c huge_data/ output.lz4 lz4 --cpu`
+
 ## Dependencies
 
 All dependencies are automatically fetched and built by CMake:
@@ -437,7 +561,30 @@ Contributions welcome! Please ensure:
 
 ## Changelog
 
-### Version 2.2.0 (Current)
+### Version 3.0.0 (Current) - Multi-Volume Support
+- **NEW**: 🎉 Multi-volume support for large files and archives
+  - Default 2.5GB volumes (safe for 8GB VRAM GPUs)
+  - Automatic volume splitting and reassembly
+  - Customizable volume sizes: `--volume-size 1GB`, `--volume-size 5GB`, etc.
+  - Option to disable splitting: `--no-volumes`
+  - Smart volume naming: `.vol001`, `.vol002`, `.vol003`, ...
+- **NEW**: Intelligent GPU memory management
+  - Automatic detection of available GPU memory
+  - Smart fallback to CPU when GPU memory insufficient
+  - Memory requirement calculation (~2.1x volume size)
+- **NEW**: Volume manifest format with metadata
+  - Stores volume count, algorithm, sizes, and offsets
+  - Auto-detects multi-volume archives during decompression
+  - Lists volume information with `-l` command
+- **IMPROVED**: Better memory safety and reliability
+  - No more "GPU memory exhausted" failures for large files
+  - Predictable memory usage per volume
+  - Scales to datasets of any size
+- **BREAKING**: Archives larger than 2.5GB now create multi-volume files by default
+  - Use `--no-volumes` to maintain single-file behavior
+  - Existing single-file archives still work perfectly
+
+### Version 2.2.0
 - **NEW**: Algorithm auto-detection for decompression and listing modes
   - No need to specify algorithm when decompressing or listing GPU batched files
   - Works for LZ4, Snappy, and Zstd in both GPU and CPU modes

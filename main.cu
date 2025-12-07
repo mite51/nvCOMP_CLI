@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <algorithm>
+#include <sstream>
 
 #include <cuda_runtime.h>
 
@@ -70,6 +71,13 @@ constexpr uint32_t ARCHIVE_VERSION = 1;
 constexpr uint32_t BATCHED_MAGIC = 0x4E564243; // "NVBC" (NvCOMP Batched Compression)
 constexpr uint32_t BATCHED_VERSION = 1;
 
+// Volume manifest magic
+constexpr uint32_t VOLUME_MAGIC = 0x4E56564D; // "NVVM" (NvCOMP Volume Manifest)
+constexpr uint32_t VOLUME_VERSION = 1;
+
+// Default volume size: 2.5GB (safe for 8GB VRAM GPUs)
+constexpr uint64_t DEFAULT_VOLUME_SIZE = 2684354560ULL; // 2.5GB in bytes
+
 // Archive header structure
 struct ArchiveHeader {
     uint32_t magic;
@@ -95,6 +103,26 @@ struct BatchedHeader {
     uint32_t algorithm; // AlgoType
     uint32_t reserved;
     // Followed by: chunk sizes array (chunkCount * uint64_t), then compressed data
+};
+
+// Volume manifest (stored in first volume)
+struct VolumeManifest {
+    uint32_t magic;                  // VOLUME_MAGIC
+    uint32_t version;                // VOLUME_VERSION
+    uint32_t volumeCount;            // Total number of volumes
+    uint32_t algorithm;              // AlgoType used
+    uint64_t volumeSize;             // Max uncompressed size per volume (bytes)
+    uint64_t totalUncompressedSize;  // Total archive size before compression
+    uint64_t reserved;
+    // Followed by: VolumeMetadata array (volumeCount entries)
+};
+
+// Metadata for each volume
+struct VolumeMetadata {
+    uint64_t volumeIndex;            // 1, 2, 3, ...
+    uint64_t compressedSize;         // Actual compressed size of this volume
+    uint64_t uncompressedOffset;     // Where this volume's data starts in original archive
+    uint64_t uncompressedSize;       // How much uncompressed data this volume contains
 };
 
 // Algorithm types
@@ -143,6 +171,13 @@ bool isCudaAvailable() {
 // Forward declarations
 AlgoType detectAlgorithmFromFile(const std::string& filename);
 std::vector<uint8_t> decompressBatchedFormat(AlgoType algo, const std::vector<uint8_t>& compressedData);
+
+// Volume support functions (forward declarations)
+std::string generateVolumeFilename(const std::string& baseFile, size_t volumeIndex);
+std::vector<std::string> detectVolumeFiles(const std::string& firstVolume);
+bool isVolumeFile(const std::string& filename);
+uint64_t parseVolumeSize(const std::string& sizeStr);
+bool checkGPUMemoryForVolume(uint64_t volumeSize);
 
 std::vector<uint8_t> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
@@ -222,6 +257,139 @@ void createDirectories(const fs::path& path) {
 }
 
 // ============================================================================
+// VOLUME SUPPORT FUNCTIONS
+// ============================================================================
+
+// Generate volume filename (e.g., output.lz4 + 1 -> output.vol001.lz4)
+std::string generateVolumeFilename(const std::string& baseFile, size_t volumeIndex) {
+    fs::path p(baseFile);
+    std::string stem = p.stem().string();
+    std::string ext = p.extension().string();
+    
+    std::ostringstream oss;
+    oss << stem << ".vol" << std::setw(3) << std::setfill('0') << volumeIndex << ext;
+    
+    if (p.has_parent_path()) {
+        return (p.parent_path() / oss.str()).string();
+    }
+    return oss.str();
+}
+
+// Check if filename is a volume file (contains .vol001, .vol002, etc.)
+bool isVolumeFile(const std::string& filename) {
+    return filename.find(".vol") != std::string::npos;
+}
+
+// Detect all volume files for a given first volume or base name
+std::vector<std::string> detectVolumeFiles(const std::string& inputFile) {
+    std::vector<std::string> volumes;
+    
+    // If it's a volume file, extract the base name
+    fs::path p(inputFile);
+    std::string filename = p.filename().string();
+    
+    // Check if this is already a volume file
+    size_t volPos = filename.find(".vol");
+    std::string baseName;
+    std::string ext;
+    
+    if (volPos != std::string::npos) {
+        // Extract base name (e.g., "output.vol001.lz4" -> "output" and ".lz4")
+        baseName = filename.substr(0, volPos);
+        size_t extPos = filename.find('.', volPos + 4);
+        if (extPos != std::string::npos) {
+            ext = filename.substr(extPos);
+        }
+    } else {
+        // Not a volume file, check if volume 001 exists
+        baseName = p.stem().string();
+        ext = p.extension().string();
+        
+        std::string vol001 = generateVolumeFilename(inputFile, 1);
+        if (!fs::exists(vol001)) {
+            // No volumes exist, return single file
+            volumes.push_back(inputFile);
+            return volumes;
+        }
+    }
+    
+    // Find all volumes
+    fs::path dir = p.parent_path();
+    if (dir.empty()) dir = ".";
+    
+    for (size_t i = 1; i <= 9999; i++) {
+        std::ostringstream oss;
+        oss << baseName << ".vol" << std::setw(3) << std::setfill('0') << i << ext;
+        
+        fs::path volumePath = dir / oss.str();
+        if (fs::exists(volumePath)) {
+            volumes.push_back(volumePath.string());
+        } else {
+            break; // No more volumes
+        }
+    }
+    
+    return volumes;
+}
+
+// Parse volume size string (e.g., "2.5GB", "500MB", "1TB")
+uint64_t parseVolumeSize(const std::string& sizeStr) {
+    if (sizeStr.empty()) {
+        return DEFAULT_VOLUME_SIZE;
+    }
+    
+    // Find the numeric part
+    size_t pos = 0;
+    double value = std::stod(sizeStr, &pos);
+    
+    // Find the unit part
+    std::string unit = sizeStr.substr(pos);
+    // Convert to uppercase for comparison
+    std::transform(unit.begin(), unit.end(), unit.begin(), ::toupper);
+    
+    uint64_t multiplier = 1;
+    if (unit == "KB" || unit == "K") {
+        multiplier = 1024ULL;
+    } else if (unit == "MB" || unit == "M") {
+        multiplier = 1024ULL * 1024ULL;
+    } else if (unit == "GB" || unit == "G" || unit.empty()) {
+        multiplier = 1024ULL * 1024ULL * 1024ULL;
+    } else if (unit == "TB" || unit == "T") {
+        multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+    } else {
+        throw std::runtime_error("Invalid volume size unit: " + unit);
+    }
+    
+    uint64_t result = static_cast<uint64_t>(value * multiplier);
+    
+    // Minimum 1KB to avoid excessive volumes (but allow small sizes for testing)
+    const uint64_t MIN_VOLUME_SIZE = 1024ULL;
+    if (result < MIN_VOLUME_SIZE) {
+        throw std::runtime_error("Volume size too small (minimum 1KB)");
+    }
+    
+    return result;
+}
+
+// Check if GPU has sufficient memory for a given volume size
+bool checkGPUMemoryForVolume(uint64_t volumeSize) {
+    if (!isCudaAvailable()) {
+        return false;
+    }
+    
+    size_t free, total;
+    cudaError_t err = cudaMemGetInfo(&free, &total);
+    if (err != cudaSuccess) {
+        return false;
+    }
+    
+    // Need ~2.1x volume size for input + output + temp buffers
+    uint64_t requiredWithOverhead = static_cast<uint64_t>(volumeSize * 2.1);
+    
+    return free >= requiredWithOverhead;
+}
+
+// ============================================================================
 // ARCHIVE CREATION AND EXTRACTION
 // ============================================================================
 
@@ -286,6 +454,50 @@ std::vector<uint8_t> createArchive(const std::string& inputPath) {
     }
     
     return archiveData;
+}
+
+// Split archive data into volumes
+std::vector<std::vector<uint8_t>> splitIntoVolumes(
+    const std::vector<uint8_t>& archiveData,
+    uint64_t maxVolumeSize
+) {
+    std::vector<std::vector<uint8_t>> volumes;
+    
+    // If archive fits in single volume, return as-is
+    if (archiveData.size() <= maxVolumeSize) {
+        volumes.push_back(archiveData);
+        return volumes;
+    }
+    
+    // Split into multiple volumes (mid-file splitting allowed)
+    size_t remaining = archiveData.size();
+    size_t offset = 0;
+    size_t volumeIndex = 1;
+    
+    std::cout << "Splitting archive into volumes (max " 
+              << (maxVolumeSize / (1024.0 * 1024.0 * 1024.0)) << " GB each)..." << std::endl;
+    
+    while (remaining > 0) {
+        size_t volumeSize = std::min(static_cast<size_t>(maxVolumeSize), remaining);
+        
+        std::vector<uint8_t> volume(
+            archiveData.begin() + offset,
+            archiveData.begin() + offset + volumeSize
+        );
+        
+        volumes.push_back(volume);
+        
+        std::cout << "  Volume " << volumeIndex << ": " 
+                  << (volumeSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+        
+        offset += volumeSize;
+        remaining -= volumeSize;
+        volumeIndex++;
+    }
+    
+    std::cout << "Created " << volumes.size() << " volume(s)" << std::endl;
+    
+    return volumes;
 }
 
 // Extract archive to directory
@@ -564,36 +776,214 @@ std::vector<uint8_t> decompressDataCPU(AlgoType algo, const std::vector<uint8_t>
     return outputData;
 }
 
-void compressCPU(AlgoType algo, const std::string& inputPath, const std::string& outputFile) {
+void compressCPU(AlgoType algo, const std::string& inputPath, const std::string& outputFile, uint64_t maxVolumeSize) {
     std::cout << "Using CPU compression (" << algoToString(algo) << ")..." << std::endl;
     
     // Create archive (handles both files and directories)
-    std::vector<uint8_t> inputData;
+    std::vector<uint8_t> archiveData;
     if (isDirectory(inputPath)) {
-        inputData = createArchive(inputPath);
+        archiveData = createArchive(inputPath);
     } else {
-        inputData = createArchive(inputPath);
+        archiveData = createArchive(inputPath);
     }
     
-    size_t inputSize = inputData.size();
-    std::cout << "Archive size: " << inputSize << " bytes" << std::endl;
+    size_t totalSize = archiveData.size();
+    std::cout << "Archive size: " << totalSize << " bytes" << std::endl;
     
-    auto start = std::chrono::high_resolution_clock::now();
+    // Split into volumes if needed
+    auto volumes = splitIntoVolumes(archiveData, maxVolumeSize);
     
-    auto outputData = compressDataCPU(algo, inputData);
+    // If single volume, use original behavior
+    if (volumes.size() == 1) {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto outputData = compressDataCPU(algo, volumes[0]);
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        double duration = std::chrono::duration<double>(end - start).count();
+        size_t compSize = outputData.size();
+        
+        std::cout << "Compressed size: " << compSize << " bytes" << std::endl;
+        std::cout << "Ratio: " << std::fixed << std::setprecision(2) << (double)totalSize / compSize << "x" << std::endl;
+        std::cout << "Time: " << duration << "s (" << (totalSize / (1024.0 * 1024.0 * 1024.0)) / duration << " GB/s)" << std::endl;
+        
+        writeFile(outputFile, outputData.data(), outputData.size());
+        return;
+    }
     
-    auto end = std::chrono::high_resolution_clock::now();
-    double duration = std::chrono::duration<double>(end - start).count();
+    // Multi-volume compression
+    std::cout << "\nCompressing " << volumes.size() << " volume(s)..." << std::endl;
     
-    size_t compSize = outputData.size();
-    std::cout << "Compressed size: " << compSize << " bytes" << std::endl;
-    std::cout << "Ratio: " << std::fixed << std::setprecision(2) << (double)inputSize / compSize << "x" << std::endl;
-    std::cout << "Time: " << duration << "s (" << (inputSize / (1024.0 * 1024.0 * 1024.0)) / duration << " GB/s)" << std::endl;
+    std::vector<VolumeMetadata> volumeMetadata;
+    uint64_t uncompressedOffset = 0;
+    double totalDuration = 0;
+    size_t totalCompressedSize = 0;
     
-    writeFile(outputFile, outputData.data(), outputData.size());
+    for (size_t i = 0; i < volumes.size(); i++) {
+        // Show progress on single line
+        std::cout << "\r  Processing volume " << (i + 1) << "/" << volumes.size() << "..." << std::flush;
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        auto compressed = compressDataCPU(algo, volumes[i]);
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        double duration = std::chrono::duration<double>(end - start).count();
+        totalDuration += duration;
+        
+        // Create volume metadata
+        VolumeMetadata meta;
+        meta.volumeIndex = i + 1;
+        meta.compressedSize = compressed.size();
+        meta.uncompressedOffset = uncompressedOffset;
+        meta.uncompressedSize = volumes[i].size();
+        volumeMetadata.push_back(meta);
+        
+        uncompressedOffset += volumes[i].size();
+        totalCompressedSize += compressed.size();
+        
+        // Write volume file
+        std::string volumeFile = generateVolumeFilename(outputFile, i + 1);
+        writeFile(volumeFile, compressed.data(), compressed.size());
+    }
+    
+    std::cout << "\r  Processing volume " << volumes.size() << "/" << volumes.size() << "... Done!" << std::endl;
+    
+    // Create and prepend manifest to first volume
+    
+    VolumeManifest manifest;
+    manifest.magic = VOLUME_MAGIC;
+    manifest.version = VOLUME_VERSION;
+    manifest.volumeCount = static_cast<uint32_t>(volumes.size());
+    manifest.algorithm = static_cast<uint32_t>(algo);
+    manifest.volumeSize = maxVolumeSize;
+    manifest.totalUncompressedSize = totalSize;
+    manifest.reserved = 0;
+    
+    // Read first volume
+    std::string firstVolumeFile = generateVolumeFilename(outputFile, 1);
+    auto firstVolumeData = readFile(firstVolumeFile);
+    
+    // Create new first volume with manifest
+    std::vector<uint8_t> newFirstVolume;
+    
+    // Add manifest header
+    const uint8_t* manifestBytes = reinterpret_cast<const uint8_t*>(&manifest);
+    newFirstVolume.insert(newFirstVolume.end(), manifestBytes, manifestBytes + sizeof(VolumeManifest));
+    
+    // Add volume metadata array
+    const uint8_t* metadataBytes = reinterpret_cast<const uint8_t*>(volumeMetadata.data());
+    newFirstVolume.insert(newFirstVolume.end(), metadataBytes, 
+                         metadataBytes + sizeof(VolumeMetadata) * volumeMetadata.size());
+    
+    // Add original compressed data
+    newFirstVolume.insert(newFirstVolume.end(), firstVolumeData.begin(), firstVolumeData.end());
+    
+    // Write updated first volume
+    writeFile(firstVolumeFile, newFirstVolume.data(), newFirstVolume.size());
+    
+    // Update metadata for first volume
+    volumeMetadata[0].compressedSize = newFirstVolume.size();
+    totalCompressedSize = totalCompressedSize - firstVolumeData.size() + newFirstVolume.size();
+    
+    std::cout << "\n=== Multi-Volume Compression SUCCESSFUL ===" << std::endl;
+    std::cout << "Volumes created: " << volumes.size() << std::endl;
+    std::cout << "Total uncompressed: " << (totalSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Total compressed: " << (totalCompressedSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Overall ratio: " << std::fixed << std::setprecision(2) 
+              << (double)totalSize / totalCompressedSize << "x" << std::endl;
+    std::cout << "Total time: " << totalDuration << "s (" 
+              << (totalSize / (1024.0 * 1024.0 * 1024.0)) / totalDuration << " GB/s)" << std::endl;
 }
 
 void decompressCPU(AlgoType algo, const std::string& inputFile, const std::string& outputPath) {
+    // Detect volume files
+    auto volumeFiles = detectVolumeFiles(inputFile);
+    
+    // Check if multi-volume
+    if (volumeFiles.size() > 1 || isVolumeFile(volumeFiles[0])) {
+        // Read manifest from first volume
+        auto firstVolumeData = readFile(volumeFiles[0]);
+        
+        if (firstVolumeData.size() < sizeof(VolumeManifest)) {
+            throw std::runtime_error("Invalid volume file: too small for manifest");
+        }
+        
+        VolumeManifest manifest;
+        std::memcpy(&manifest, firstVolumeData.data(), sizeof(VolumeManifest));
+        
+        if (manifest.magic != VOLUME_MAGIC) {
+            // Not a multi-volume archive, treat as single file
+            std::cout << "Using CPU decompression (" << algoToString(algo) << ")..." << std::endl;
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            auto archiveData = decompressBatchedFormat(algo, firstVolumeData);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            double duration = std::chrono::duration<double>(end - start).count();
+            size_t decompSize = archiveData.size();
+            std::cout << "Decompressed size: " << decompSize << " bytes" << std::endl;
+            std::cout << "Time: " << duration << "s (" << (decompSize / (1024.0 * 1024.0 * 1024.0)) / duration << " GB/s)" << std::endl;
+            
+            extractArchive(archiveData, outputPath);
+            return;
+        }
+        
+        // Multi-volume archive
+        std::cout << "Multi-volume archive detected: " << manifest.volumeCount << " volume(s)" << std::endl;
+        std::cout << "Using CPU decompression (" << algoToString(static_cast<AlgoType>(manifest.algorithm)) << ")..." << std::endl;
+        
+        // Read volume metadata
+        size_t metadataOffset = sizeof(VolumeManifest);
+        std::vector<VolumeMetadata> volumeMetadata(manifest.volumeCount);
+        std::memcpy(volumeMetadata.data(), firstVolumeData.data() + metadataOffset, 
+                   sizeof(VolumeMetadata) * manifest.volumeCount);
+        
+        // Check all volumes exist
+        if (volumeFiles.size() != manifest.volumeCount) {
+            std::cerr << "Error: Expected " << manifest.volumeCount << " volumes, found " << volumeFiles.size() << std::endl;
+            std::cerr << "Missing volumes!" << std::endl;
+            throw std::runtime_error("Missing volume files");
+        }
+        
+        // Decompress all volumes
+        std::vector<uint8_t> fullArchive;
+        fullArchive.reserve(manifest.totalUncompressedSize);
+        double totalDuration = 0;
+        
+        for (size_t i = 0; i < volumeFiles.size(); i++) {
+            std::cout << "\nDecompressing volume " << (i + 1) << "/" << volumeFiles.size() << "..." << std::endl;
+            
+            auto volumeData = readFile(volumeFiles[i]);
+            
+            // Skip manifest and metadata in first volume
+            size_t dataOffset = 0;
+            if (i == 0) {
+                dataOffset = sizeof(VolumeManifest) + sizeof(VolumeMetadata) * manifest.volumeCount;
+                volumeData = std::vector<uint8_t>(volumeData.begin() + dataOffset, volumeData.end());
+            }
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            auto decompressed = decompressBatchedFormat(static_cast<AlgoType>(manifest.algorithm), volumeData);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            double duration = std::chrono::duration<double>(end - start).count();
+            totalDuration += duration;
+            
+            std::cout << "  Decompressed: " << decompressed.size() << " bytes in " << duration << "s" << std::endl;
+            
+            fullArchive.insert(fullArchive.end(), decompressed.begin(), decompressed.end());
+        }
+        
+        std::cout << "\n=== Decompression Summary ===" << std::endl;
+        std::cout << "Total decompressed: " << fullArchive.size() << " bytes" << std::endl;
+        std::cout << "Total time: " << totalDuration << "s (" 
+                  << (fullArchive.size() / (1024.0 * 1024.0 * 1024.0)) / totalDuration << " GB/s)" << std::endl;
+        
+        // Extract archive
+        extractArchive(fullArchive, outputPath);
+        return;
+    }
+    
+    // Single file (non-volume)
     // Try to auto-detect algorithm if not specified
     AlgoType detectedAlgo = detectAlgorithmFromFile(inputFile);
     if (detectedAlgo != ALGO_UNKNOWN) {
@@ -625,19 +1015,27 @@ void decompressCPU(AlgoType algo, const std::string& inputFile, const std::strin
 // GPU BATCHED API (LZ4, Snappy, Zstd) - Cross-compatible with CPU
 // ============================================================================
 
-void compressGPUBatched(AlgoType algo, const std::string& inputPath, const std::string& outputFile) {
+void compressGPUBatched(AlgoType algo, const std::string& inputPath, const std::string& outputFile, uint64_t maxVolumeSize) {
     std::cout << "Using GPU batched compression (" << algoToString(algo) << ")..." << std::endl;
     
     // Create archive (handles both files and directories)
-    std::vector<uint8_t> inputData;
+    std::vector<uint8_t> archiveData;
     if (isDirectory(inputPath)) {
-        inputData = createArchive(inputPath);
+        archiveData = createArchive(inputPath);
     } else {
-        inputData = createArchive(inputPath);
+        archiveData = createArchive(inputPath);
     }
     
-    size_t inputSize = inputData.size();
-    std::cout << "Archive size: " << inputSize << " bytes" << std::endl;
+    size_t totalSize = archiveData.size();
+    std::cout << "Archive size: " << totalSize << " bytes" << std::endl;
+    
+    // Split into volumes if needed
+    auto volumes = splitIntoVolumes(archiveData, maxVolumeSize);
+    
+    // If single volume, use original behavior (continue with existing code)
+    if (volumes.size() == 1) {
+        size_t inputSize = volumes[0].size();
+        std::vector<uint8_t> inputData = volumes[0];
     
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -782,8 +1180,8 @@ void compressGPUBatched(AlgoType algo, const std::string& inputPath, const std::
         offset += h_output_sizes[i];
     }
     
-    size_t totalSize = outputData.size();
-    std::cout << "Total size with metadata: " << totalSize << " bytes" << std::endl;
+    size_t totalSizeWithMeta = outputData.size();
+    std::cout << "Total size with metadata: " << totalSizeWithMeta << " bytes" << std::endl;
     
     writeFile(outputFile, outputData.data(), outputData.size());
     
@@ -796,6 +1194,238 @@ void compressGPUBatched(AlgoType algo, const std::string& inputPath, const std::
     cudaFree(d_output_sizes);
     cudaFree(d_temp);
     cudaStreamDestroy(stream);
+        return;
+    }
+    
+    // Multi-volume compression
+    std::cout << "\nCompressing " << volumes.size() << " volume(s)..." << std::endl;
+    
+    std::vector<VolumeMetadata> volumeMetadata;
+    uint64_t uncompressedOffset = 0;
+    double totalDuration = 0;
+    size_t totalCompressedSize = 0;
+    
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    
+    for (size_t volIdx = 0; volIdx < volumes.size(); volIdx++) {
+        // Show progress on single line
+        std::cout << "\r  Processing volume " << (volIdx + 1) << "/" << volumes.size() << "..." << std::flush;
+        
+        std::vector<uint8_t>& inputData = volumes[volIdx];
+        size_t inputSize = inputData.size();
+        
+        // Calculate chunks
+        size_t chunk_count = (inputSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        
+        // Prepare input chunks
+        std::vector<void*> h_input_ptrs(chunk_count);
+        std::vector<size_t> h_input_sizes(chunk_count);
+        
+        for (size_t i = 0; i < chunk_count; i++) {
+            size_t offset = i * CHUNK_SIZE;
+            h_input_sizes[i] = std::min(CHUNK_SIZE, inputSize - offset);
+        }
+        
+        // Allocate device memory for input
+        uint8_t* d_input_data;
+        CUDA_CHECK(cudaMalloc(&d_input_data, inputSize));
+        CUDA_CHECK(cudaMemcpy(d_input_data, inputData.data(), inputSize, cudaMemcpyHostToDevice));
+        
+        // Setup input pointers
+        void** d_input_ptrs;
+        size_t* d_input_sizes;
+        CUDA_CHECK(cudaMalloc(&d_input_ptrs, sizeof(void*) * chunk_count));
+        CUDA_CHECK(cudaMalloc(&d_input_sizes, sizeof(size_t) * chunk_count));
+        
+        for (size_t i = 0; i < chunk_count; i++) {
+            h_input_ptrs[i] = d_input_data + i * CHUNK_SIZE;
+        }
+        CUDA_CHECK(cudaMemcpy(d_input_ptrs, h_input_ptrs.data(), sizeof(void*) * chunk_count, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_input_sizes, h_input_sizes.data(), sizeof(size_t) * chunk_count, cudaMemcpyHostToDevice));
+        
+        // Get temp size and max output size
+        size_t temp_bytes;
+        size_t max_out_bytes;
+        
+        if (algo == ALGO_LZ4) {
+            NVCOMP_CHECK(nvcompBatchedLZ4CompressGetTempSizeAsync(
+                chunk_count, CHUNK_SIZE, nvcompBatchedLZ4CompressDefaultOpts, &temp_bytes, inputSize));
+            NVCOMP_CHECK(nvcompBatchedLZ4CompressGetMaxOutputChunkSize(
+                CHUNK_SIZE, nvcompBatchedLZ4CompressDefaultOpts, &max_out_bytes));
+        } else if (algo == ALGO_SNAPPY) {
+            NVCOMP_CHECK(nvcompBatchedSnappyCompressGetTempSizeAsync(
+                chunk_count, CHUNK_SIZE, nvcompBatchedSnappyCompressDefaultOpts, &temp_bytes, inputSize));
+            NVCOMP_CHECK(nvcompBatchedSnappyCompressGetMaxOutputChunkSize(
+                CHUNK_SIZE, nvcompBatchedSnappyCompressDefaultOpts, &max_out_bytes));
+        } else if (algo == ALGO_ZSTD) {
+            NVCOMP_CHECK(nvcompBatchedZstdCompressGetTempSizeAsync(
+                chunk_count, CHUNK_SIZE, nvcompBatchedZstdCompressDefaultOpts, &temp_bytes, inputSize));
+            NVCOMP_CHECK(nvcompBatchedZstdCompressGetMaxOutputChunkSize(
+                CHUNK_SIZE, nvcompBatchedZstdCompressDefaultOpts, &max_out_bytes));
+        }
+        
+        // Allocate temp and output
+        void* d_temp;
+        CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));
+        
+        uint8_t* d_output_data;
+        CUDA_CHECK(cudaMalloc(&d_output_data, max_out_bytes * chunk_count));
+        
+        void** d_output_ptrs;
+        size_t* d_output_sizes;
+        CUDA_CHECK(cudaMalloc(&d_output_ptrs, sizeof(void*) * chunk_count));
+        CUDA_CHECK(cudaMalloc(&d_output_sizes, sizeof(size_t) * chunk_count));
+        
+        std::vector<void*> h_output_ptrs(chunk_count);
+        for (size_t i = 0; i < chunk_count; i++) {
+            h_output_ptrs[i] = d_output_data + i * max_out_bytes;
+        }
+        CUDA_CHECK(cudaMemcpy(d_output_ptrs, h_output_ptrs.data(), sizeof(void*) * chunk_count, cudaMemcpyHostToDevice));
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // Compress
+        if (algo == ALGO_LZ4) {
+            NVCOMP_CHECK(nvcompBatchedLZ4CompressAsync(
+                d_input_ptrs, d_input_sizes, CHUNK_SIZE, chunk_count,
+                d_temp, temp_bytes, d_output_ptrs, d_output_sizes,
+                nvcompBatchedLZ4CompressDefaultOpts, nullptr, stream));
+        } else if (algo == ALGO_SNAPPY) {
+            NVCOMP_CHECK(nvcompBatchedSnappyCompressAsync(
+                d_input_ptrs, d_input_sizes, CHUNK_SIZE, chunk_count,
+                d_temp, temp_bytes, d_output_ptrs, d_output_sizes,
+                nvcompBatchedSnappyCompressDefaultOpts, nullptr, stream));
+        } else if (algo == ALGO_ZSTD) {
+            NVCOMP_CHECK(nvcompBatchedZstdCompressAsync(
+                d_input_ptrs, d_input_sizes, CHUNK_SIZE, chunk_count,
+                d_temp, temp_bytes, d_output_ptrs, d_output_sizes,
+                nvcompBatchedZstdCompressDefaultOpts, nullptr, stream));
+        }
+        
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        // Get output sizes
+        std::vector<size_t> h_output_sizes(chunk_count);
+        CUDA_CHECK(cudaMemcpy(h_output_sizes.data(), d_output_sizes, sizeof(size_t) * chunk_count, cudaMemcpyDeviceToHost));
+        
+        // Calculate total size
+        size_t totalCompSize = 0;
+        for (size_t i = 0; i < chunk_count; i++) {
+            totalCompSize += h_output_sizes[i];
+        }
+        
+        double duration = std::chrono::duration<double>(end - start).count();
+        totalDuration += duration;
+        
+        // Create output with metadata
+        std::vector<uint8_t> outputData;
+        
+        // Write batched header
+        BatchedHeader header;
+        header.magic = BATCHED_MAGIC;
+        header.version = BATCHED_VERSION;
+        header.uncompressedSize = inputSize;
+        header.chunkCount = static_cast<uint32_t>(chunk_count);
+        header.chunkSize = CHUNK_SIZE;
+        header.algorithm = static_cast<uint32_t>(algo);
+        header.reserved = 0;
+        
+        const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
+        outputData.insert(outputData.end(), headerBytes, headerBytes + sizeof(BatchedHeader));
+        
+        // Write chunk sizes
+        std::vector<uint64_t> chunkSizes64(chunk_count);
+        for (size_t i = 0; i < chunk_count; i++) {
+            chunkSizes64[i] = h_output_sizes[i];
+        }
+        const uint8_t* sizesBytes = reinterpret_cast<const uint8_t*>(chunkSizes64.data());
+        outputData.insert(outputData.end(), sizesBytes, sizesBytes + sizeof(uint64_t) * chunk_count);
+        
+        // Copy compressed chunks
+        size_t dataStart = outputData.size();
+        outputData.resize(dataStart + totalCompSize);
+        size_t offset = 0;
+        for (size_t i = 0; i < chunk_count; i++) {
+            CUDA_CHECK(cudaMemcpy(outputData.data() + dataStart + offset, h_output_ptrs[i], h_output_sizes[i], cudaMemcpyDeviceToHost));
+            offset += h_output_sizes[i];
+        }
+        
+        // Create volume metadata
+        VolumeMetadata meta;
+        meta.volumeIndex = volIdx + 1;
+        meta.compressedSize = outputData.size();
+        meta.uncompressedOffset = uncompressedOffset;
+        meta.uncompressedSize = inputSize;
+        volumeMetadata.push_back(meta);
+        
+        uncompressedOffset += inputSize;
+        totalCompressedSize += outputData.size();
+        
+        // Write volume file
+        std::string volumeFile = generateVolumeFilename(outputFile, volIdx + 1);
+        writeFile(volumeFile, outputData.data(), outputData.size());
+        
+        // Cleanup for this volume
+        cudaFree(d_input_data);
+        cudaFree(d_input_ptrs);
+        cudaFree(d_input_sizes);
+        cudaFree(d_output_data);
+        cudaFree(d_output_ptrs);
+        cudaFree(d_output_sizes);
+        cudaFree(d_temp);
+    }
+    
+    cudaStreamDestroy(stream);
+    
+    std::cout << "\r  Processing volume " << volumes.size() << "/" << volumes.size() << "... Done!" << std::endl;
+    
+    // Create and prepend manifest to first volume
+    
+    VolumeManifest manifest;
+    manifest.magic = VOLUME_MAGIC;
+    manifest.version = VOLUME_VERSION;
+    manifest.volumeCount = static_cast<uint32_t>(volumes.size());
+    manifest.algorithm = static_cast<uint32_t>(algo);
+    manifest.volumeSize = maxVolumeSize;
+    manifest.totalUncompressedSize = totalSize;
+    manifest.reserved = 0;
+    
+    // Read first volume
+    std::string firstVolumeFile = generateVolumeFilename(outputFile, 1);
+    auto firstVolumeData = readFile(firstVolumeFile);
+    
+    // Create new first volume with manifest
+    std::vector<uint8_t> newFirstVolume;
+    
+    // Add manifest header
+    const uint8_t* manifestBytes = reinterpret_cast<const uint8_t*>(&manifest);
+    newFirstVolume.insert(newFirstVolume.end(), manifestBytes, manifestBytes + sizeof(VolumeManifest));
+    
+    // Add volume metadata array
+    const uint8_t* metadataBytes = reinterpret_cast<const uint8_t*>(volumeMetadata.data());
+    newFirstVolume.insert(newFirstVolume.end(), metadataBytes, 
+                         metadataBytes + sizeof(VolumeMetadata) * volumeMetadata.size());
+    
+    // Add original compressed data
+    newFirstVolume.insert(newFirstVolume.end(), firstVolumeData.begin(), firstVolumeData.end());
+    
+    // Write updated first volume
+    writeFile(firstVolumeFile, newFirstVolume.data(), newFirstVolume.size());
+    
+    // Update metadata for first volume
+    volumeMetadata[0].compressedSize = newFirstVolume.size();
+    totalCompressedSize = totalCompressedSize - firstVolumeData.size() + newFirstVolume.size();
+    
+    std::cout << "\n=== Multi-Volume Compression SUCCESSFUL ===" << std::endl;
+    std::cout << "Volumes created: " << volumes.size() << std::endl;
+    std::cout << "Total uncompressed: " << (totalSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Total compressed: " << (totalCompressedSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Overall ratio: " << std::fixed << std::setprecision(2) 
+              << (double)totalSize / totalCompressedSize << "x" << std::endl;
+    std::cout << "Total time: " << totalDuration << "s (" 
+              << (totalSize / (1024.0 * 1024.0 * 1024.0)) / totalDuration << " GB/s)" << std::endl;
 }
 
 // Detect algorithm from batched format file header
@@ -875,7 +1505,111 @@ std::vector<uint8_t> decompressBatchedFormat(AlgoType algo, const std::vector<ui
 }
 
 void decompressGPUBatched(AlgoType algo, const std::string& inputFile, const std::string& outputPath) {
-    // Try to auto-detect algorithm if not specified
+    // Detect volume files
+    auto volumeFiles = detectVolumeFiles(inputFile);
+    
+    // Check if multi-volume
+    if (volumeFiles.size() > 1 || isVolumeFile(volumeFiles[0])) {
+        // Read manifest from first volume
+        auto firstVolumeData = readFile(volumeFiles[0]);
+        
+        if (firstVolumeData.size() < sizeof(VolumeManifest)) {
+            throw std::runtime_error("Invalid volume file: too small for manifest");
+        }
+        
+        VolumeManifest manifest;
+        std::memcpy(&manifest, firstVolumeData.data(), sizeof(VolumeManifest));
+        
+        if (manifest.magic != VOLUME_MAGIC) {
+            // Not a multi-volume archive, treat as single file
+            AlgoType detectedAlgo = detectAlgorithmFromFile(inputFile);
+            if (detectedAlgo != ALGO_UNKNOWN) {
+                algo = detectedAlgo;
+                std::cout << "Auto-detected algorithm from file: " << algoToString(algo) << std::endl;
+            }
+            
+            std::cout << "Decompressing (" << algoToString(algo) << ")..." << std::endl;
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            auto archiveData = decompressBatchedFormat(algo, firstVolumeData);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            double duration = std::chrono::duration<double>(end - start).count();
+            size_t decompSize = archiveData.size();
+            std::cout << "Decompressed size: " << decompSize << " bytes" << std::endl;
+            std::cout << "Time: " << duration << "s (" << (decompSize / (1024.0 * 1024.0 * 1024.0)) / duration << " GB/s)" << std::endl;
+            
+            extractArchive(archiveData, outputPath);
+            return;
+        }
+        
+        // Multi-volume archive
+        std::cout << "Multi-volume archive detected: " << manifest.volumeCount << " volume(s)" << std::endl;
+        
+        // Check GPU memory
+        if (!checkGPUMemoryForVolume(manifest.volumeSize)) {
+            std::cout << "Insufficient GPU memory for " << (manifest.volumeSize / (1024.0 * 1024.0 * 1024.0)) 
+                      << " GB volumes (need ~" << (manifest.volumeSize * 2.1 / (1024.0 * 1024.0 * 1024.0)) 
+                      << " GB VRAM)." << std::endl;
+            std::cout << "Falling back to CPU decompression..." << std::endl;
+            decompressCPU(algo, inputFile, outputPath);
+            return;
+        }
+        
+        std::cout << "Using GPU decompression (" << algoToString(static_cast<AlgoType>(manifest.algorithm)) << ")..." << std::endl;
+        
+        // Read volume metadata
+        size_t metadataOffset = sizeof(VolumeManifest);
+        std::vector<VolumeMetadata> volumeMetadata(manifest.volumeCount);
+        std::memcpy(volumeMetadata.data(), firstVolumeData.data() + metadataOffset, 
+                   sizeof(VolumeMetadata) * manifest.volumeCount);
+        
+        // Check all volumes exist
+        if (volumeFiles.size() != manifest.volumeCount) {
+            std::cerr << "Error: Expected " << manifest.volumeCount << " volumes, found " << volumeFiles.size() << std::endl;
+            throw std::runtime_error("Missing volume files");
+        }
+        
+        // Decompress all volumes (using CPU for batched format since it's easier)
+        std::vector<uint8_t> fullArchive;
+        fullArchive.reserve(manifest.totalUncompressedSize);
+        double totalDuration = 0;
+        
+        for (size_t i = 0; i < volumeFiles.size(); i++) {
+            std::cout << "\nDecompressing volume " << (i + 1) << "/" << volumeFiles.size() << "..." << std::endl;
+            
+            auto volumeData = readFile(volumeFiles[i]);
+            
+            // Skip manifest and metadata in first volume
+            size_t dataOffset = 0;
+            if (i == 0) {
+                dataOffset = sizeof(VolumeManifest) + sizeof(VolumeMetadata) * manifest.volumeCount;
+                volumeData = std::vector<uint8_t>(volumeData.begin() + dataOffset, volumeData.end());
+            }
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            auto decompressed = decompressBatchedFormat(static_cast<AlgoType>(manifest.algorithm), volumeData);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            double duration = std::chrono::duration<double>(end - start).count();
+            totalDuration += duration;
+            
+            std::cout << "  Decompressed: " << decompressed.size() << " bytes in " << duration << "s" << std::endl;
+            
+            fullArchive.insert(fullArchive.end(), decompressed.begin(), decompressed.end());
+        }
+        
+        std::cout << "\n=== Decompression Summary ===" << std::endl;
+        std::cout << "Total decompressed: " << fullArchive.size() << " bytes" << std::endl;
+        std::cout << "Total time: " << totalDuration << "s (" 
+                  << (fullArchive.size() / (1024.0 * 1024.0 * 1024.0)) / totalDuration << " GB/s)" << std::endl;
+        
+        // Extract archive
+        extractArchive(fullArchive, outputPath);
+        return;
+    }
+    
+    // Single file (non-volume)
     AlgoType detectedAlgo = detectAlgorithmFromFile(inputFile);
     if (detectedAlgo != ALGO_UNKNOWN) {
         algo = detectedAlgo;
@@ -906,19 +1640,27 @@ void decompressGPUBatched(AlgoType algo, const std::string& inputFile, const std
 // GPU MANAGER API (GDeflate, ANS, Bitcomp) - GPU-only
 // ============================================================================
 
-void compressGPUManager(AlgoType algo, const std::string& inputPath, const std::string& outputFile) {
+void compressGPUManager(AlgoType algo, const std::string& inputPath, const std::string& outputFile, uint64_t maxVolumeSize) {
     std::cout << "Using GPU manager compression (" << algoToString(algo) << ")..." << std::endl;
     
     // Create archive (handles both files and directories)
-    std::vector<uint8_t> inputData;
+    std::vector<uint8_t> archiveData;
     if (isDirectory(inputPath)) {
-        inputData = createArchive(inputPath);
+        archiveData = createArchive(inputPath);
     } else {
-        inputData = createArchive(inputPath);
+        archiveData = createArchive(inputPath);
     }
     
-    size_t inputSize = inputData.size();
-    std::cout << "Archive size: " << inputSize << " bytes" << std::endl;
+    size_t totalSize = archiveData.size();
+    std::cout << "Archive size: " << totalSize << " bytes" << std::endl;
+    
+    // Split into volumes if needed
+    auto volumes = splitIntoVolumes(archiveData, maxVolumeSize);
+    
+    // If single volume, use original behavior
+    if (volumes.size() == 1) {
+        size_t inputSize = volumes[0].size();
+        std::vector<uint8_t> inputData = volumes[0];
     
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -967,9 +1709,276 @@ void compressGPUManager(AlgoType algo, const std::string& inputPath, const std::
     cudaFree(d_input);
     cudaFree(d_output);
     cudaStreamDestroy(stream);
+        return;
+    }
+    
+    // Multi-volume compression
+    std::cout << "\nCompressing " << volumes.size() << " volume(s)..." << std::endl;
+    
+    std::vector<VolumeMetadata> volumeMetadata;
+    uint64_t uncompressedOffset = 0;
+    double totalDuration = 0;
+    size_t totalCompressedSize = 0;
+    
+    for (size_t volIdx = 0; volIdx < volumes.size(); volIdx++) {
+        // Show progress on single line
+        std::cout << "\r  Processing volume " << (volIdx + 1) << "/" << volumes.size() << "..." << std::flush;
+        
+        std::vector<uint8_t>& inputData = volumes[volIdx];
+        size_t inputSize = inputData.size();
+        
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreate(&stream));
+        
+        uint8_t* d_input;
+        CUDA_CHECK(cudaMalloc(&d_input, inputSize));
+        CUDA_CHECK(cudaMemcpyAsync(d_input, inputData.data(), inputSize, cudaMemcpyHostToDevice, stream));
+        
+        std::shared_ptr<nvcompManagerBase> manager;
+        
+        if (algo == ALGO_GDEFLATE) {
+            manager = std::make_shared<GdeflateManager>(
+                CHUNK_SIZE, nvcompBatchedGdeflateCompressDefaultOpts, nvcompBatchedGdeflateDecompressDefaultOpts, stream);
+        } else if (algo == ALGO_ANS) {
+            manager = std::make_shared<ANSManager>(
+                CHUNK_SIZE, nvcompBatchedANSCompressDefaultOpts, nvcompBatchedANSDecompressDefaultOpts, stream);
+        } else if (algo == ALGO_BITCOMP) {
+            manager = std::make_shared<BitcompManager>(
+                CHUNK_SIZE, nvcompBatchedBitcompCompressDefaultOpts, nvcompBatchedBitcompDecompressDefaultOpts, stream);
+        }
+        
+        CompressionConfig comp_config = manager->configure_compression(inputSize);
+        
+        uint8_t* d_output;
+        CUDA_CHECK(cudaMalloc(&d_output, comp_config.max_compressed_buffer_size));
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        manager->compress(d_input, d_output, comp_config);
+        
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        size_t compSize = manager->get_compressed_output_size(d_output);
+        
+        double duration = std::chrono::duration<double>(end - start).count();
+        totalDuration += duration;
+        
+        std::vector<uint8_t> outputData(compSize);
+        CUDA_CHECK(cudaMemcpy(outputData.data(), d_output, compSize, cudaMemcpyDeviceToHost));
+        
+        // Create volume metadata
+        VolumeMetadata meta;
+        meta.volumeIndex = volIdx + 1;
+        meta.compressedSize = compSize;
+        meta.uncompressedOffset = uncompressedOffset;
+        meta.uncompressedSize = inputSize;
+        volumeMetadata.push_back(meta);
+        
+        uncompressedOffset += inputSize;
+        totalCompressedSize += compSize;
+        
+        // Write volume file
+        std::string volumeFile = generateVolumeFilename(outputFile, volIdx + 1);
+        writeFile(volumeFile, outputData.data(), outputData.size());
+        
+        cudaFree(d_input);
+        cudaFree(d_output);
+        cudaStreamDestroy(stream);
+    }
+    
+    std::cout << "\r  Processing volume " << volumes.size() << "/" << volumes.size() << "... Done!" << std::endl;
+    
+    // Create and prepend manifest to first volume
+    
+    VolumeManifest manifest;
+    manifest.magic = VOLUME_MAGIC;
+    manifest.version = VOLUME_VERSION;
+    manifest.volumeCount = static_cast<uint32_t>(volumes.size());
+    manifest.algorithm = static_cast<uint32_t>(algo);
+    manifest.volumeSize = maxVolumeSize;
+    manifest.totalUncompressedSize = totalSize;
+    manifest.reserved = 0;
+    
+    // Read first volume
+    std::string firstVolumeFile = generateVolumeFilename(outputFile, 1);
+    auto firstVolumeData = readFile(firstVolumeFile);
+    
+    // Create new first volume with manifest
+    std::vector<uint8_t> newFirstVolume;
+    
+    // Add manifest header
+    const uint8_t* manifestBytes = reinterpret_cast<const uint8_t*>(&manifest);
+    newFirstVolume.insert(newFirstVolume.end(), manifestBytes, manifestBytes + sizeof(VolumeManifest));
+    
+    // Add volume metadata array
+    const uint8_t* metadataBytes = reinterpret_cast<const uint8_t*>(volumeMetadata.data());
+    newFirstVolume.insert(newFirstVolume.end(), metadataBytes, 
+                         metadataBytes + sizeof(VolumeMetadata) * volumeMetadata.size());
+    
+    // Add original compressed data
+    newFirstVolume.insert(newFirstVolume.end(), firstVolumeData.begin(), firstVolumeData.end());
+    
+    // Write updated first volume
+    writeFile(firstVolumeFile, newFirstVolume.data(), newFirstVolume.size());
+    
+    // Update metadata for first volume
+    volumeMetadata[0].compressedSize = newFirstVolume.size();
+    totalCompressedSize = totalCompressedSize - firstVolumeData.size() + newFirstVolume.size();
+    
+    std::cout << "\n=== Multi-Volume Compression SUCCESSFUL ===" << std::endl;
+    std::cout << "Volumes created: " << volumes.size() << std::endl;
+    std::cout << "Total uncompressed: " << (totalSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Total compressed: " << (totalCompressedSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Overall ratio: " << std::fixed << std::setprecision(2) 
+              << (double)totalSize / totalCompressedSize << "x" << std::endl;
+    std::cout << "Total time: " << totalDuration << "s (" 
+              << (totalSize / (1024.0 * 1024.0 * 1024.0)) / totalDuration << " GB/s)" << std::endl;
 }
 
 void decompressGPUManager(const std::string& inputFile, const std::string& outputPath) {
+    // Detect volume files
+    auto volumeFiles = detectVolumeFiles(inputFile);
+    
+    // Check if multi-volume
+    if (volumeFiles.size() > 1 || isVolumeFile(volumeFiles[0])) {
+        // Read manifest from first volume
+        auto firstVolumeData = readFile(volumeFiles[0]);
+        
+        if (firstVolumeData.size() < sizeof(VolumeManifest)) {
+            throw std::runtime_error("Invalid volume file: too small for manifest");
+        }
+        
+        VolumeManifest manifest;
+        std::memcpy(&manifest, firstVolumeData.data(), sizeof(VolumeManifest));
+        
+        if (manifest.magic != VOLUME_MAGIC) {
+            // Not a multi-volume archive, treat as single file
+            std::cout << "Using GPU manager decompression (auto-detect)..." << std::endl;
+            
+            size_t inputSize = firstVolumeData.size();
+            cudaStream_t stream;
+            CUDA_CHECK(cudaStreamCreate(&stream));
+            
+            uint8_t* d_input;
+            CUDA_CHECK(cudaMalloc(&d_input, inputSize));
+            CUDA_CHECK(cudaMemcpyAsync(d_input, firstVolumeData.data(), inputSize, cudaMemcpyHostToDevice, stream));
+            
+            auto manager = create_manager(d_input, stream);
+            DecompressionConfig decomp_config = manager->configure_decompression(d_input);
+            size_t outputSize = decomp_config.decomp_data_size;
+            std::cout << "Detected original size: " << outputSize << " bytes" << std::endl;
+            
+            uint8_t* d_output;
+            CUDA_CHECK(cudaMalloc(&d_output, outputSize));
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            manager->decompress(d_output, d_input, decomp_config);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            double duration = std::chrono::duration<double>(end - start).count();
+            std::cout << "Time: " << duration << "s (" << (outputSize / (1024.0 * 1024.0 * 1024.0)) / duration << " GB/s)" << std::endl;
+            
+            std::vector<uint8_t> archiveData(outputSize);
+            CUDA_CHECK(cudaMemcpy(archiveData.data(), d_output, outputSize, cudaMemcpyDeviceToHost));
+            
+            cudaFree(d_input);
+            cudaFree(d_output);
+            cudaStreamDestroy(stream);
+            
+            extractArchive(archiveData, outputPath);
+            return;
+        }
+        
+        // Multi-volume archive
+        std::cout << "Multi-volume archive detected: " << manifest.volumeCount << " volume(s)" << std::endl;
+        
+        // Check GPU memory
+        if (!checkGPUMemoryForVolume(manifest.volumeSize)) {
+            std::cout << "Insufficient GPU memory for " << (manifest.volumeSize / (1024.0 * 1024.0 * 1024.0)) 
+                      << " GB volumes (need ~" << (manifest.volumeSize * 2.1 / (1024.0 * 1024.0 * 1024.0)) 
+                      << " GB VRAM)." << std::endl;
+            throw std::runtime_error("Insufficient GPU memory for GPU-only algorithm. Cannot fall back to CPU.");
+        }
+        
+        std::cout << "Using GPU manager decompression..." << std::endl;
+        
+        // Read volume metadata
+        size_t metadataOffset = sizeof(VolumeManifest);
+        std::vector<VolumeMetadata> volumeMetadata(manifest.volumeCount);
+        std::memcpy(volumeMetadata.data(), firstVolumeData.data() + metadataOffset, 
+                   sizeof(VolumeMetadata) * manifest.volumeCount);
+        
+        // Check all volumes exist
+        if (volumeFiles.size() != manifest.volumeCount) {
+            std::cerr << "Error: Expected " << manifest.volumeCount << " volumes, found " << volumeFiles.size() << std::endl;
+            throw std::runtime_error("Missing volume files");
+        }
+        
+        // Decompress all volumes
+        std::vector<uint8_t> fullArchive;
+        fullArchive.reserve(manifest.totalUncompressedSize);
+        double totalDuration = 0;
+        
+        for (size_t i = 0; i < volumeFiles.size(); i++) {
+            std::cout << "\nDecompressing volume " << (i + 1) << "/" << volumeFiles.size() << "..." << std::endl;
+            
+            auto volumeData = readFile(volumeFiles[i]);
+            
+            // Skip manifest and metadata in first volume
+            size_t dataOffset = 0;
+            if (i == 0) {
+                dataOffset = sizeof(VolumeManifest) + sizeof(VolumeMetadata) * manifest.volumeCount;
+                volumeData = std::vector<uint8_t>(volumeData.begin() + dataOffset, volumeData.end());
+            }
+            
+            size_t inputSize = volumeData.size();
+            cudaStream_t stream;
+            CUDA_CHECK(cudaStreamCreate(&stream));
+            
+            uint8_t* d_input;
+            CUDA_CHECK(cudaMalloc(&d_input, inputSize));
+            CUDA_CHECK(cudaMemcpyAsync(d_input, volumeData.data(), inputSize, cudaMemcpyHostToDevice, stream));
+            
+            auto manager = create_manager(d_input, stream);
+            DecompressionConfig decomp_config = manager->configure_decompression(d_input);
+            size_t outputSize = decomp_config.decomp_data_size;
+            
+            uint8_t* d_output;
+            CUDA_CHECK(cudaMalloc(&d_output, outputSize));
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            manager->decompress(d_output, d_input, decomp_config);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            double duration = std::chrono::duration<double>(end - start).count();
+            totalDuration += duration;
+            
+            std::cout << "  Decompressed: " << outputSize << " bytes in " << duration << "s" << std::endl;
+            
+            std::vector<uint8_t> decompressed(outputSize);
+            CUDA_CHECK(cudaMemcpy(decompressed.data(), d_output, outputSize, cudaMemcpyDeviceToHost));
+            
+            fullArchive.insert(fullArchive.end(), decompressed.begin(), decompressed.end());
+            
+            cudaFree(d_input);
+            cudaFree(d_output);
+            cudaStreamDestroy(stream);
+        }
+        
+        std::cout << "\n=== Decompression Summary ===" << std::endl;
+        std::cout << "Total decompressed: " << fullArchive.size() << " bytes" << std::endl;
+        std::cout << "Total time: " << totalDuration << "s (" 
+                  << (fullArchive.size() / (1024.0 * 1024.0 * 1024.0)) / totalDuration << " GB/s)" << std::endl;
+        
+        // Extract archive
+        extractArchive(fullArchive, outputPath);
+        return;
+    }
+    
+    // Single file (non-volume)
     std::cout << "Using GPU manager decompression (auto-detect)..." << std::endl;
     
     auto inputData = readFile(inputFile);
@@ -1017,6 +2026,108 @@ void decompressGPUManager(const std::string& inputFile, const std::string& outpu
 // ============================================================================
 
 void listCompressedArchive(AlgoType algo, const std::string& inputFile, bool useCPU, bool cudaAvailable) {
+    // Detect volume files
+    auto volumeFiles = detectVolumeFiles(inputFile);
+    
+    // Check if multi-volume
+    if (volumeFiles.size() > 1 || isVolumeFile(volumeFiles[0])) {
+        // Read manifest from first volume
+        auto firstVolumeData = readFile(volumeFiles[0]);
+        
+        if (firstVolumeData.size() < sizeof(VolumeManifest)) {
+            throw std::runtime_error("Invalid volume file: too small for manifest");
+        }
+        
+        VolumeManifest manifest;
+        std::memcpy(&manifest, firstVolumeData.data(), sizeof(VolumeManifest));
+        
+        if (manifest.magic != VOLUME_MAGIC) {
+            // Not a multi-volume archive, treat as single file - continue with normal logic below
+        } else {
+            // Multi-volume archive
+            std::cout << "Multi-volume archive detected: " << manifest.volumeCount << " volume(s)" << std::endl;
+            std::cout << "Algorithm: " << algoToString(static_cast<AlgoType>(manifest.algorithm)) << std::endl;
+            
+            // List volumes
+            std::cout << "\nVolume files:" << std::endl;
+            for (size_t i = 0; i < volumeFiles.size(); i++) {
+                fs::path p(volumeFiles[i]);
+                size_t fileSize = fs::file_size(p);
+                std::cout << "  " << p.filename().string() << " - " 
+                          << (fileSize / (1024.0 * 1024.0)) << " MB" << std::endl;
+            }
+            
+            std::cout << "\nDecompressing archive to list contents..." << std::endl;
+            
+            // Check GPU memory if needed
+            AlgoType archiveAlgo = static_cast<AlgoType>(manifest.algorithm);
+            bool needGPU = !isCrossCompatible(archiveAlgo);
+            
+            if (needGPU && !checkGPUMemoryForVolume(manifest.volumeSize)) {
+                std::cout << "Insufficient GPU memory. Cannot decompress GPU-only algorithm." << std::endl;
+                throw std::runtime_error("Insufficient GPU memory");
+            }
+            
+            // Read volume metadata
+            size_t metadataOffset = sizeof(VolumeManifest);
+            std::vector<VolumeMetadata> volumeMetadata(manifest.volumeCount);
+            std::memcpy(volumeMetadata.data(), firstVolumeData.data() + metadataOffset, 
+                       sizeof(VolumeMetadata) * manifest.volumeCount);
+            
+            // Decompress all volumes
+            std::vector<uint8_t> fullArchive;
+            fullArchive.reserve(manifest.totalUncompressedSize);
+            
+            for (size_t i = 0; i < volumeFiles.size(); i++) {
+                auto volumeData = readFile(volumeFiles[i]);
+                
+                // Skip manifest and metadata in first volume
+                if (i == 0) {
+                    size_t dataOffset = sizeof(VolumeManifest) + sizeof(VolumeMetadata) * manifest.volumeCount;
+                    volumeData = std::vector<uint8_t>(volumeData.begin() + dataOffset, volumeData.end());
+                }
+                
+                // Decompress based on algorithm type
+                if (isCrossCompatible(archiveAlgo)) {
+                    auto decompressed = decompressBatchedFormat(archiveAlgo, volumeData);
+                    fullArchive.insert(fullArchive.end(), decompressed.begin(), decompressed.end());
+                } else {
+                    // GPU Manager
+                    cudaStream_t stream;
+                    CUDA_CHECK(cudaStreamCreate(&stream));
+                    
+                    uint8_t* d_input;
+                    CUDA_CHECK(cudaMalloc(&d_input, volumeData.size()));
+                    CUDA_CHECK(cudaMemcpyAsync(d_input, volumeData.data(), volumeData.size(), cudaMemcpyHostToDevice, stream));
+                    
+                    auto manager = create_manager(d_input, stream);
+                    DecompressionConfig decomp_config = manager->configure_decompression(d_input);
+                    size_t outputSize = decomp_config.decomp_data_size;
+                    
+                    uint8_t* d_output;
+                    CUDA_CHECK(cudaMalloc(&d_output, outputSize));
+                    
+                    manager->decompress(d_output, d_input, decomp_config);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    
+                    std::vector<uint8_t> decompressed(outputSize);
+                    CUDA_CHECK(cudaMemcpy(decompressed.data(), d_output, outputSize, cudaMemcpyDeviceToHost));
+                    
+                    fullArchive.insert(fullArchive.end(), decompressed.begin(), decompressed.end());
+                    
+                    cudaFree(d_input);
+                    cudaFree(d_output);
+                    cudaStreamDestroy(stream);
+                }
+            }
+            
+            std::cout << std::endl;
+            listArchive(fullArchive);
+            return;
+        }
+    }
+    
+    // Single file (non-volume) or non-volume file named like a volume
     // Try to auto-detect algorithm if not specified
     AlgoType detectedAlgo = detectAlgorithmFromFile(inputFile);
     if (detectedAlgo != ALGO_UNKNOWN) {
@@ -1072,32 +2183,37 @@ void listCompressedArchive(AlgoType algo, const std::string& inputFile, bool use
 // ============================================================================
 
 void printUsage(const char* appName) {
-    std::cerr << "nvCOMP CLI with CPU Fallback & Folder Support\n\n";
+    std::cerr << "nvCOMP CLI with CPU Fallback & Multi-Volume Support\n\n";
     std::cerr << "Usage:\n";
-    std::cerr << "  Compress:   " << appName << " -c <input> <output> <algorithm> [--cpu]\n";
-    std::cerr << "  Decompress: " << appName << " -d <input> <output> [algorithm] [--cpu]\n";
-    std::cerr << "  List:       " << appName << " -l <archive> [algorithm] [--cpu]\n\n";
+    std::cerr << "  Compress:   " << appName << " -c <input> <output> <algorithm> [options]\n";
+    std::cerr << "  Decompress: " << appName << " -d <input> <output> [algorithm] [options]\n";
+    std::cerr << "  List:       " << appName << " -l <archive> [algorithm] [options]\n\n";
     std::cerr << "Arguments:\n";
     std::cerr << "  <input>     Input file or directory (for compression)\n";
     std::cerr << "  <output>    Output file (compression) or directory (decompression)\n";
-    std::cerr << "  <archive>   Compressed archive file to list\n";
+    std::cerr << "  <archive>   Compressed archive file to list (e.g., output.vol001.lz4 or output.lz4)\n";
     std::cerr << "  [algorithm] Optional for -d/-l (auto-detected), required for -c\n\n";
     std::cerr << "Algorithms:\n";
     std::cerr << "  Cross-compatible (GPU/CPU): lz4, snappy, zstd\n";
     std::cerr << "  GPU-only: gdeflate, ans, bitcomp\n\n";
     std::cerr << "Options:\n";
-    std::cerr << "  --cpu    Force CPU mode\n";
+    std::cerr << "  --cpu              Force CPU mode\n";
+    std::cerr << "  --volume-size <N>  Set max volume size (default: 2.5GB)\n";
+    std::cerr << "                     Examples: 1GB, 500MB, 5GB\n";
+    std::cerr << "  --no-volumes       Disable volume splitting (single file)\n";
     std::cerr << "\nExamples:\n";
-    std::cerr << "  # Compress single file (algorithm required)\n";
+    std::cerr << "  # Compress with default 2.5GB volumes\n";
     std::cerr << "  " << appName << " -c input.txt output.lz4 lz4\n\n";
-    std::cerr << "  # Compress entire folder\n";
-    std::cerr << "  " << appName << " -c mydata/ output.zstd zstd\n\n";
-    std::cerr << "  # Decompress with auto-detection (no algorithm needed!)\n";
+    std::cerr << "  # Compress entire folder with custom volume size\n";
+    std::cerr << "  " << appName << " -c mydata/ output.zstd zstd --volume-size 1GB\n\n";
+    std::cerr << "  # Compress without volume splitting\n";
+    std::cerr << "  " << appName << " -c mydata/ output.lz4 lz4 --no-volumes\n\n";
+    std::cerr << "  # Decompress multi-volume archive (auto-detects volumes)\n";
+    std::cerr << "  " << appName << " -d output.vol001.lz4 restored/\n\n";
+    std::cerr << "  # Decompress single file with auto-detection\n";
     std::cerr << "  " << appName << " -d output.lz4 restored/\n\n";
-    std::cerr << "  # Decompress with explicit algorithm\n";
-    std::cerr << "  " << appName << " -d output.lz4 restored/ lz4\n\n";
-    std::cerr << "  # List archive with auto-detection\n";
-    std::cerr << "  " << appName << " -l output.zstd\n\n";
+    std::cerr << "  # List multi-volume archive\n";
+    std::cerr << "  " << appName << " -l output.vol001.zstd\n\n";
     std::cerr << "  # Force CPU mode\n";
     std::cerr << "  " << appName << " -c input.txt output.lz4 lz4 --cpu\n";
 }
@@ -1126,16 +2242,39 @@ int main(int argc, char** argv) {
         std::string outputPath = (argc >= 4) ? argv[3] : "";
         std::string algoStr = "";
         bool forceCPU = false;
+        uint64_t maxVolumeSize = DEFAULT_VOLUME_SIZE;
+        bool noVolumes = false;
         
         // Parse algorithm and flags
         for (int i = (mode == "-l" ? 3 : 4); i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--cpu") {
                 forceCPU = true;
+            } else if (arg == "--no-volumes") {
+                noVolumes = true;
+            } else if (arg == "--volume-size") {
+                if (i + 1 < argc) {
+                    i++;
+                    try {
+                        maxVolumeSize = parseVolumeSize(argv[i]);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: " << e.what() << std::endl;
+                        return 1;
+                    }
+                } else {
+                    std::cerr << "Error: --volume-size requires a size argument" << std::endl;
+                    printUsage(argv[0]);
+                    return 1;
+                }
             } else {
                 // Assume it's an algorithm
                 algoStr = arg;
             }
+        }
+        
+        // If --no-volumes is set, use a very large volume size
+        if (noVolumes) {
+            maxVolumeSize = UINT64_MAX;
         }
         
         // Parse algorithm (default to ALGO_UNKNOWN for auto-detection)
@@ -1173,13 +2312,16 @@ int main(int argc, char** argv) {
         
         if (mode == "-c") {
             // Compression mode
+            std::cout << "Volume size: " << (maxVolumeSize == UINT64_MAX ? "unlimited" : 
+                         std::to_string(maxVolumeSize / (1024.0 * 1024.0 * 1024.0)) + " GB") << std::endl;
+            
             if (useCPU) {
-                compressCPU(algo, inputPath, outputPath);
+                compressCPU(algo, inputPath, outputPath, maxVolumeSize);
             } else {
                 if (isCrossCompatible(algo)) {
-                    compressGPUBatched(algo, inputPath, outputPath);
+                    compressGPUBatched(algo, inputPath, outputPath, maxVolumeSize);
                 } else {
-                    compressGPUManager(algo, inputPath, outputPath);
+                    compressGPUManager(algo, inputPath, outputPath, maxVolumeSize);
                 }
             }
         } else if (mode == "-d") {

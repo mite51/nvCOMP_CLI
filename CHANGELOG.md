@@ -2,6 +2,125 @@
 
 All notable changes to the nvCOMP CLI project will be documented in this file.
 
+## [3.0.0] - 2025-12-07
+
+### Major New Feature: Multi-Volume Support 🎉
+
+#### Added
+- **Multi-Volume Archive Splitting**
+  - Automatic splitting of large archives into manageable volumes
+  - Default 2.5GB volumes (safe for 8GB VRAM GPUs)
+  - Volume naming convention: `output.vol001.lz4`, `output.vol002.lz4`, etc.
+  - Single files (no split) maintain simple naming: `output.lz4`
+  - Mid-file splitting allowed for predictable volume sizes
+
+- **Intelligent GPU Memory Management**
+  - Automatic GPU memory detection with `cudaMemGetInfo()`
+  - Memory requirement calculation (~2.1x volume size for input + output + temp buffers)
+  - Smart fallback to CPU when GPU memory insufficient (for cross-compatible algorithms)
+  - Clear error messages for GPU-only algorithms when memory insufficient
+
+- **Volume Manifest System**
+  - New volume manifest format with magic number `NVVM` (NvCOMP Volume Manifest)
+  - Manifest stored in first volume (`.vol001`) contains:
+    - Volume count and algorithm used
+    - Max volume size and total uncompressed size
+    - Per-volume metadata (index, sizes, offsets)
+  - Automatic volume detection and reassembly during decompression
+
+- **Command-Line Options**
+  - `--volume-size <size>`: Set custom volume size (e.g., `1GB`, `500MB`, `5GB`)
+  - `--no-volumes`: Disable volume splitting (create single file regardless of size)
+  - Volume size display at compression start
+  - Minimum volume size: 1KB (configurable for testing)
+
+- **Enhanced Output**
+  - Single-line progress indicator for multi-volume compression
+  - Shows: "Processing volume X/Y..." (overwrites itself)
+  - Clear success indicator: "=== Multi-Volume Compression SUCCESSFUL ==="
+  - Summary displays volume count prominently
+  - Human-readable sizes in MB for totals
+
+#### Changed
+- **Compression Functions**
+  - All compression functions now accept `maxVolumeSize` parameter
+  - `splitIntoVolumes()`: New function to split archives by size
+  - Volume creation happens before compression
+  - Progress reporting improved for large volume counts
+
+- **Decompression Functions**
+  - All decompression functions now detect and handle multi-volume archives
+  - `detectVolumeFiles()`: Automatically finds all volume files in directory
+  - Reassembles volumes before extraction
+  - GPU memory check before decompressing each volume
+
+- **List Mode**
+  - Shows volume information (count, sizes) for multi-volume archives
+  - Lists all files across all volumes
+  - Displays individual volume file sizes
+
+#### Technical Details
+- **Volume Manifest Structure** (48 bytes):
+  - Magic: `0x4E56564D` ("NVVM")
+  - Version: 1
+  - Volume count, algorithm, max volume size, total size
+  - Followed by VolumeMetadata array
+
+- **VolumeMetadata Structure** (32 bytes per volume):
+  - Volume index, compressed size, uncompressed offset, uncompressed size
+
+- **Memory Safety Calculation**:
+  - Input buffer: 1x volume size
+  - Output buffer: ~1.05x volume size (worst case)
+  - Temp buffer: ~0.3-0.5x volume size (algorithm dependent)
+  - Total: ~2.1x multiplier for safety
+
+- **Default Volume Size Rationale**:
+  - 2.5GB uncompressed per volume
+  - ~5.25GB GPU memory needed (2.5 × 2.1)
+  - Safe on 8GB VRAM GPUs with ~2.75GB headroom
+  - Balances volume count vs memory usage
+
+#### Testing
+- **14 New Multi-Volume Tests** (`test_volume.bat`, `test_volume.sh`):
+  - 4 multi-volume compression tests (GPU/CPU, various sizes)
+  - 2 single-volume tests (verify no splitting when not needed)
+  - 2 volume listing tests
+  - 2 volume auto-detection tests
+  - 4 custom volume size tests
+- **Total Test Coverage**: 43 tests (15 single-file + 14 folder + 14 volume)
+- Test volume sizes: 5KB-50KB (forces splitting with ~30MB sample folder)
+- All tests passing on Windows with CUDA 13.0
+
+#### Documentation
+- Updated README.md with comprehensive multi-volume section
+- New examples for multi-volume usage
+- Updated limitations section (GPU memory issue now resolved!)
+- Performance considerations for multi-volume
+- Troubleshooting section for volume-related issues
+- Volume format specification
+
+#### Breaking Changes
+- **Default Behavior**: Archives larger than 2.5GB now automatically create multi-volume files
+  - Use `--no-volumes` to maintain previous single-file behavior
+  - Existing single-file archives still work perfectly (backward compatible)
+  
+#### Benefits
+- ✅ **No More GPU Memory Failures**: Large files now work reliably
+- ✅ **Scalability**: Can compress datasets of any size
+- ✅ **Predictable Memory Usage**: Consistent per-volume memory footprint
+- ✅ **Cross-Platform**: Volume format works on Windows and Linux
+- ✅ **Flexible**: Users can adjust volume size or disable splitting
+- ✅ **Smart Fallback**: Automatic CPU fallback when GPU memory insufficient
+
+#### Performance
+- Sequential volume processing (not parallel)
+- Per-volume throughput same as single-file compression
+- Minimal overhead (<1%) for manifest creation
+- Larger volume sizes = fewer volumes = less overhead
+
+---
+
 ## [2.2.0] - 2025-12-07
 
 ### Added

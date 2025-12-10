@@ -164,7 +164,23 @@ endif()
 find_package(nvcomp REQUIRED)
 
 # ============================================================================
-# Create executable
+# Build Core Library
+# ============================================================================
+
+# Pass dependency include directories to core library via parent scope includes
+# This allows core to find lz4, snappy, zstd headers
+include_directories(
+    ${lz4_SOURCE_DIR}/lib
+    ${snappy_SOURCE_DIR}
+    ${snappy_BINARY_DIR}
+    ${zstd_SOURCE_DIR}/lib
+)
+
+# Build core library subdirectory
+add_subdirectory(core)
+
+# ============================================================================
+# Create CLI executable
 # ============================================================================
 
 add_executable(nvcomp_cli main.cu)
@@ -174,6 +190,7 @@ set_property(TARGET nvcomp_cli PROPERTY CUDA_ARCHITECTURES 75 80 86 89 90)
 
 # Include directories
 target_include_directories(nvcomp_cli PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
     ${lz4_SOURCE_DIR}/lib
     ${snappy_SOURCE_DIR}
     ${snappy_BINARY_DIR}
@@ -181,7 +198,10 @@ target_include_directories(nvcomp_cli PRIVATE
 )
 
 # Link libraries
+# NOTE: main.cu still contains old code (not refactored yet - that's Task 1.3)
+# So it needs direct access to compression libraries for now
 target_link_libraries(nvcomp_cli PRIVATE 
+    nvcomp_core
     nvcomp::nvcomp
     lz4_static
     snappy

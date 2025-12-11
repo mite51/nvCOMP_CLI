@@ -14,6 +14,7 @@ set(CORE_SOURCES
     src/volume.cpp
     src/nvcomp_cpu.cpp
     src/nvcomp_core.cu
+    src/nvcomp_c_api.cpp
 )
 
 # Create shared library

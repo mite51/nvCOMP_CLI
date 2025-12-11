@@ -284,15 +284,44 @@ void compressCPU(AlgoType algo, const std::string& inputPath, const std::string&
     // If single volume, use original behavior
     if (volumes.size() == 1) {
         auto start = std::chrono::high_resolution_clock::now();
-        auto outputData = compressDataCPU(algo, volumes[0]);
+        auto compressedData = compressDataCPU(algo, volumes[0]);
         auto end = std::chrono::high_resolution_clock::now();
         
         double duration = std::chrono::duration<double>(end - start).count();
-        size_t compSize = outputData.size();
+        size_t compSize = compressedData.size();
         
         std::cout << "Compressed size: " << compSize << " bytes" << std::endl;
         std::cout << "Ratio: " << std::fixed << std::setprecision(2) << (double)totalSize / compSize << "x" << std::endl;
         std::cout << "Time: " << duration << "s (" << (totalSize / (1024.0 * 1024.0 * 1024.0)) / duration << " GB/s)" << std::endl;
+        
+        // Write with BatchedHeader for algorithm detection compatibility
+        // Use a simple single-chunk format
+        BatchedHeader header;
+        header.magic = BATCHED_MAGIC;
+        header.version = BATCHED_VERSION;
+        header.uncompressedSize = totalSize;
+        header.chunkCount = 1;
+        header.chunkSize = totalSize;
+        header.algorithm = static_cast<uint32_t>(algo);
+        header.reserved = 0;
+        
+        // Build output: header + chunk size + compressed data
+        std::vector<uint8_t> outputData;
+        outputData.reserve(sizeof(BatchedHeader) + sizeof(uint64_t) + compSize);
+        
+        // Append header
+        outputData.insert(outputData.end(), 
+                         reinterpret_cast<uint8_t*>(&header),
+                         reinterpret_cast<uint8_t*>(&header) + sizeof(BatchedHeader));
+        
+        // Append chunk size
+        uint64_t chunkSize64 = compSize;
+        outputData.insert(outputData.end(),
+                         reinterpret_cast<uint8_t*>(&chunkSize64),
+                         reinterpret_cast<uint8_t*>(&chunkSize64) + sizeof(uint64_t));
+        
+        // Append compressed data
+        outputData.insert(outputData.end(), compressedData.begin(), compressedData.end());
         
         writeFile(outputFile, outputData.data(), outputData.size());
         return;
@@ -499,4 +528,5 @@ void decompressCPU(AlgoType algo, const std::string& inputFile, const std::strin
 }
 
 } // namespace nvcomp_core
+
 

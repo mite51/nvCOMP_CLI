@@ -222,6 +222,38 @@ if(WIN32)
 endif()
 
 # ============================================================================
+# Create Test Executable for C API
+# ============================================================================
+
+add_executable(test_c_api unit_test/test_c_api.cpp)
+
+# Include directories
+target_include_directories(test_c_api PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+)
+
+# Link libraries
+target_link_libraries(test_c_api PRIVATE 
+    nvcomp_core
+)
+
+# Windows-specific: Copy DLLs to test output directory
+if(WIN32)
+    add_custom_command(TARGET test_c_api POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:nvcomp_core>
+        $<TARGET_FILE_DIR:test_c_api>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${NVCOMP_PATH}/bin/nvcomp64_5.dll"
+        $<TARGET_FILE_DIR:test_c_api>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${NVCOMP_PATH}/bin/nvcomp_cpu64_5.dll"
+        $<TARGET_FILE_DIR:test_c_api>
+        COMMENT "Copying DLLs to test output directory"
+    )
+endif()
+
+# ============================================================================
 # Installation (optional)
 # ============================================================================
 

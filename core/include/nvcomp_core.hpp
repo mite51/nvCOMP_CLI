@@ -157,3 +157,4 @@ NVCOMP_CORE_API AlgoType detectAlgorithmFromFile(const std::string& filename);
 
 } // namespace nvcomp_core
 
+

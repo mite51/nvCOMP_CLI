@@ -104,6 +104,7 @@ AlgoType detectAlgorithmFromFile(const std::string& filename) {
         return ALGO_UNKNOWN;
     }
     
+    // Try to read BatchedHeader
     BatchedHeader header;
     file.read(reinterpret_cast<char*>(&header), sizeof(BatchedHeader));
     
@@ -422,4 +423,5 @@ void listCompressedArchive(AlgoType algo, const std::string& inputFile, bool use
 }
 
 } // namespace nvcomp_core
+
 

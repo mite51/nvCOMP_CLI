@@ -26,6 +26,26 @@ set_property(TARGET nvcomp_core PROPERTY CUDA_ARCHITECTURES 75 80 86 89 90)
 # Define export macro
 target_compile_definitions(nvcomp_core PRIVATE NVCOMP_CORE_EXPORTS)
 
+# ============================================================================
+# Platform-specific configuration
+# ============================================================================
+
+if(UNIX AND NOT APPLE)
+    # Linux: Configure RPATH for finding dependencies
+    set_target_properties(nvcomp_core PROPERTIES
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
+        BUILD_WITH_INSTALL_RPATH FALSE
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+    )
+elseif(WIN32)
+    # Windows: Set output name and properties
+    set_target_properties(nvcomp_core PROPERTIES
+        WINDOWS_EXPORT_ALL_SYMBOLS TRUE
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    )
+endif()
+
 # Include directories
 target_include_directories(nvcomp_core 
     PUBLIC

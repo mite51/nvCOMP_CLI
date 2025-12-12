@@ -5,6 +5,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ============================================================================
+# Build Options
+# ============================================================================
+
+option(BUILD_CLI "Build the command-line interface" ON)
+option(BUILD_GUI "Build the Qt GUI application" OFF)
+option(BUILD_TESTS "Build test executables" ON)
+
+message(STATUS "Build configuration:")
+message(STATUS "  BUILD_CLI:   ${BUILD_CLI}")
+message(STATUS "  BUILD_GUI:   ${BUILD_GUI}")
+message(STATUS "  BUILD_TESTS: ${BUILD_TESTS}")
+
 include(FetchContent)
 
 # ============================================================================
@@ -164,6 +177,23 @@ endif()
 find_package(nvcomp REQUIRED)
 
 # ============================================================================
+# Find Qt6 (if building GUI)
+# ============================================================================
+
+if(BUILD_GUI)
+    message(STATUS "Searching for Qt6...")
+    find_package(Qt6 COMPONENTS Core Widgets Gui REQUIRED)
+    if(Qt6_FOUND)
+        message(STATUS "Qt6 found: ${Qt6_VERSION}")
+        message(STATUS "  Qt6Core:    ${Qt6Core_DIR}")
+        message(STATUS "  Qt6Widgets: ${Qt6Widgets_DIR}")
+        message(STATUS "  Qt6Gui:     ${Qt6Gui_DIR}")
+    else()
+        message(FATAL_ERROR "Qt6 is required for GUI build but was not found")
+    endif()
+endif()
+
+# ============================================================================
 # Build Core Library
 # ============================================================================
 
@@ -176,90 +206,210 @@ include_directories(
     ${zstd_SOURCE_DIR}/lib
 )
 
-# Build core library subdirectory
+# Build core library subdirectory (always built - required by CLI/GUI/tests)
 add_subdirectory(core)
 
 # ============================================================================
 # Create CLI executable
 # ============================================================================
 
-add_executable(nvcomp_cli main.cu)
+if(BUILD_CLI)
+    message(STATUS "Configuring CLI executable...")
+    
+    add_executable(nvcomp_cli main.cu)
 
-# Set CUDA architectures
-set_property(TARGET nvcomp_cli PROPERTY CUDA_ARCHITECTURES 75 80 86 89 90)
+    # Set CUDA architectures
+    set_property(TARGET nvcomp_cli PROPERTY CUDA_ARCHITECTURES 75 80 86 89 90)
 
-# Include directories
-# The CLI only needs the core library C API headers
-target_include_directories(nvcomp_cli PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
-)
-
-# Link libraries
-# The CLI is now a thin wrapper around the core library (Task 1.3)
-# All compression logic is handled by nvcomp_core
-target_link_libraries(nvcomp_cli PRIVATE 
-    nvcomp_core
-)
-
-# Windows-specific: Copy DLLs to output directory
-if(WIN32)
-    add_custom_command(TARGET nvcomp_cli POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NVCOMP_PATH}/bin/nvcomp64_5.dll"
-        $<TARGET_FILE_DIR:nvcomp_cli>
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NVCOMP_PATH}/bin/nvcomp_cpu64_5.dll"
-        $<TARGET_FILE_DIR:nvcomp_cli>
-        COMMENT "Copying nvCOMP DLLs to output directory"
+    # Include directories
+    # The CLI only needs the core library C API headers
+    target_include_directories(nvcomp_cli PRIVATE 
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/include
     )
+
+    # Link libraries
+    # The CLI is now a thin wrapper around the core library (Task 1.3)
+    # All compression logic is handled by nvcomp_core
+    target_link_libraries(nvcomp_cli PRIVATE 
+        nvcomp_core
+    )
+
+    # ========================================================================
+    # Platform-specific configuration
+    # ========================================================================
+
+    if(WIN32)
+        # Windows: Copy DLLs to output directory
+        add_custom_command(TARGET nvcomp_cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NVCOMP_PATH}/bin/nvcomp64_5.dll"
+            $<TARGET_FILE_DIR:nvcomp_cli>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NVCOMP_PATH}/bin/nvcomp_cpu64_5.dll"
+            $<TARGET_FILE_DIR:nvcomp_cli>
+            COMMENT "Copying nvCOMP DLLs to CLI output directory"
+        )
+        
+        # Copy core library DLL to CLI directory
+        add_custom_command(TARGET nvcomp_cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:nvcomp_core>
+            $<TARGET_FILE_DIR:nvcomp_cli>
+            COMMENT "Copying nvcomp_core DLL to CLI output directory"
+        )
+    else()
+        # Linux: Set RPATH to find shared libraries
+        set_target_properties(nvcomp_cli PROPERTIES
+            INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH FALSE
+            LINK_FLAGS "-Wl,--disable-new-dtags"
+        )
+    endif()
+    
+    # ========================================================================
+    # Installation
+    # ========================================================================
+    
+    install(TARGETS nvcomp_cli
+        RUNTIME DESTINATION bin
+        COMPONENT cli
+    )
+    
+    message(STATUS "CLI executable configured successfully")
 endif()
 
 # ============================================================================
-# Create Test Executable for C API
+# Create Test Executables
 # ============================================================================
 
-add_executable(test_c_api unit_test/test_c_api.cpp)
+if(BUILD_TESTS)
+    message(STATUS "Configuring test executables...")
+    
+    enable_testing()
+    
+    add_executable(test_c_api unit_test/test_c_api.cpp)
 
-# Include directories
-target_include_directories(test_c_api PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
-)
-
-# Link libraries
-target_link_libraries(test_c_api PRIVATE 
-    nvcomp_core
-)
-
-# Windows-specific: Copy DLLs to test output directory
-if(WIN32)
-    add_custom_command(TARGET test_c_api POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:nvcomp_core>
-        $<TARGET_FILE_DIR:test_c_api>
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NVCOMP_PATH}/bin/nvcomp64_5.dll"
-        $<TARGET_FILE_DIR:test_c_api>
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NVCOMP_PATH}/bin/nvcomp_cpu64_5.dll"
-        $<TARGET_FILE_DIR:test_c_api>
-        COMMENT "Copying DLLs to test output directory"
+    # Include directories
+    target_include_directories(test_c_api PRIVATE 
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/include
     )
+
+    # Link libraries
+    target_link_libraries(test_c_api PRIVATE 
+        nvcomp_core
+    )
+
+    # ========================================================================
+    # Platform-specific configuration for tests
+    # ========================================================================
+
+    if(WIN32)
+        # Windows: Copy DLLs to test output directory
+        add_custom_command(TARGET test_c_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:nvcomp_core>
+            $<TARGET_FILE_DIR:test_c_api>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NVCOMP_PATH}/bin/nvcomp64_5.dll"
+            $<TARGET_FILE_DIR:test_c_api>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NVCOMP_PATH}/bin/nvcomp_cpu64_5.dll"
+            $<TARGET_FILE_DIR:test_c_api>
+            COMMENT "Copying DLLs to test output directory"
+        )
+    else()
+        # Linux: Set RPATH for tests
+        set_target_properties(test_c_api PROPERTIES
+            INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH FALSE
+        )
+    endif()
+    
+    # ========================================================================
+    # Register tests with CTest
+    # ========================================================================
+    
+    add_test(NAME test_c_api COMMAND test_c_api)
+    
+    message(STATUS "Test executables configured successfully")
 endif()
 
 # ============================================================================
-# Installation (optional)
+# GUI Application (Future - Phase 2)
 # ============================================================================
 
-install(TARGETS nvcomp_cli DESTINATION bin)
+if(BUILD_GUI)
+    message(STATUS "Configuring GUI application...")
+    
+    # GUI will be added in Phase 2 (Task 2.1+)
+    # For now, just check that Qt6 is available
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/gui/CMakeLists.txt")
+        add_subdirectory(gui)
+        message(STATUS "GUI application configured successfully")
+    else()
+        message(WARNING "BUILD_GUI is ON but gui/ directory not found. GUI will be added in Phase 2.")
+    endif()
+endif()
+
+# ============================================================================
+# Installation Configuration
+# ============================================================================
+
+# Install core library (always)
+# Core library installation is handled in core/CMakeLists.txt
+
+# Install nvCOMP SDK DLLs/shared libraries on Windows
+if(WIN32)
+    install(FILES
+        "${NVCOMP_PATH}/bin/nvcomp64_5.dll"
+        "${NVCOMP_PATH}/bin/nvcomp_cpu64_5.dll"
+        DESTINATION bin
+        COMPONENT runtime
+    )
+endif()
+
+# Linux: nvCOMP .so files should be in a known location or use RPATH
+# The RPATH is configured per-target above
+
+# Set installation directories
+include(GNUInstallDirs)
+
+# Installation summary
+message(STATUS "Installation configuration:")
+message(STATUS "  Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "  Binaries:       ${CMAKE_INSTALL_BINDIR}")
+message(STATUS "  Libraries:      ${CMAKE_INSTALL_LIBDIR}")
+message(STATUS "  Headers:        ${CMAKE_INSTALL_INCLUDEDIR}")
 
 message(STATUS "")
 message(STATUS "========================================")
-message(STATUS "nvCOMP CLI Configuration Complete")
+message(STATUS "nvCOMP Project Configuration Complete")
 message(STATUS "========================================")
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "nvCOMP: ${NVCOMP_PATH}")
-message(STATUS "LZ4: ${lz4_SOURCE_DIR}")
-message(STATUS "Snappy: ${snappy_SOURCE_DIR}")
-message(STATUS "Zstd: ${zstd_SOURCE_DIR}")
+message(STATUS "Build configuration:")
+message(STATUS "  Build type:    ${CMAKE_BUILD_TYPE}")
+message(STATUS "  CLI:           ${BUILD_CLI}")
+message(STATUS "  GUI:           ${BUILD_GUI}")
+message(STATUS "  Tests:         ${BUILD_TESTS}")
+message(STATUS "")
+message(STATUS "Dependencies:")
+message(STATUS "  nvCOMP:        ${NVCOMP_PATH}")
+message(STATUS "  LZ4:           ${lz4_SOURCE_DIR}")
+message(STATUS "  Snappy:        ${snappy_SOURCE_DIR}")
+message(STATUS "  Zstd:          ${zstd_SOURCE_DIR}")
+if(BUILD_GUI)
+    message(STATUS "  Qt6:           ${Qt6_VERSION}")
+endif()
+message(STATUS "")
+message(STATUS "Targets built:")
+message(STATUS "  nvcomp_core:   Always (shared library)")
+if(BUILD_CLI)
+    message(STATUS "  nvcomp_cli:    Enabled")
+endif()
+if(BUILD_GUI)
+    message(STATUS "  nvcomp_gui:    Enabled (Phase 2)")
+endif()
+if(BUILD_TESTS)
+    message(STATUS "  test_c_api:    Enabled")
+endif()
 message(STATUS "========================================")
 message(STATUS "")
